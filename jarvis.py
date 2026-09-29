@@ -11,7 +11,10 @@ Press Enter to talk, or type a message instead. Say "goodbye" to stop.
 """
 import datetime
 import json
+import os
 import sys
+import tempfile
+import time
 import urllib.parse
 import webbrowser
 
@@ -31,8 +34,15 @@ if hasattr(sys.stdout, "reconfigure"):
 NAME = "Jarvis"
 MODEL = "llama3.2"          # the brain. On a strong PC try "llama3.1:8b" or "qwen2.5:7b"
 WHISPER_SIZE = "base"       # the ears. "tiny" = fastest, "small" = more accurate
-VOICE = 0                   # the voice. 0 = first Windows voice (usually David), 1 = second (usually Zira)
-RATE = 175                  # speaking speed in words per minute
+VOICE_ENGINE = "windows"    # "windows" = the voices built into Windows (works offline)
+                            # "edge"    = Microsoft's natural neural voices, the closest free thing to a movie Jarvis
+                            #             (needs internet; falls back to the Windows voice if it cannot connect)
+VOICE = 0                   # windows engine: 0 = first Windows voice (usually David), 1 = second (usually Zira)
+RATE = 175                  # windows engine: speaking speed in words per minute
+EDGE_VOICE = "en-GB-RyanNeural"   # edge engine: calm British male. Also try "en-GB-ThomasNeural".
+EDGE_RATE = "-8%"                 # edge engine: a touch slower than normal
+EDGE_PITCH = "-4Hz"               # edge engine: a touch deeper than normal
+PERSONALITY = "calm, precise and well-mannered, like a British butler with a dry sense of humour"
 LANGUAGE = "en"             # "he" = Hebrew, "es" = Spanish, "fr" = French ... or None = auto-detect
 THRESHOLD = None            # microphone sensitivity. None = measure automatically at start-up
 SAMPLE_RATE = 16000
@@ -46,7 +56,7 @@ SMART_HOME_DEVICES = {      # "what you call it": "Home Assistant entity id"
 }
 
 SYSTEM_PROMPT = (
-    f"You are {NAME}, a friendly and witty voice assistant running on the user's Windows PC. "
+    f"You are {NAME}, a voice assistant running on the user's Windows PC. You are {PERSONALITY}. "
     "Your answers are read aloud, so keep them short: one to three sentences, plain text only, "
     "no lists, no markdown, no emojis. Use a tool only when the request clearly needs it. "
     f"Today is {datetime.date.today():%A, %d %B %Y}."
@@ -55,19 +65,46 @@ SYSTEM_PROMPT = (
 # =====================================================================
 #  1. VOICE
 # =====================================================================
+def speak_windows(text: str) -> None:
+    """The voices built into Windows. Works offline."""
+    engine = pyttsx3.init()
+    voices = engine.getProperty("voices")
+    if voices and VOICE < len(voices):
+        engine.setProperty("voice", voices[VOICE].id)
+    engine.setProperty("rate", RATE)
+    engine.say(text)
+    engine.runAndWait()
+    engine.stop()
+
+
+def speak_edge(text: str) -> None:
+    """Microsoft's neural voices through the edge-tts package. Needs internet."""
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    import edge_tts
+    import pygame
+    path = os.path.join(tempfile.gettempdir(), "jarvis_voice.mp3")
+    edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE, pitch=EDGE_PITCH).save_sync(path)
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
+    pygame.mixer.music.load(path)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        time.sleep(0.05)
+    pygame.mixer.music.unload()
+
+
 def speak(text: str) -> None:
-    """Say the text out loud (and print it) using the voices built into Windows."""
+    """Say the text out loud (and print it) with whichever voice engine is selected."""
     print(f"{NAME}: {text}")
     try:
-        engine = pyttsx3.init()
-        voices = engine.getProperty("voices")
-        if voices and VOICE < len(voices):
-            engine.setProperty("voice", voices[VOICE].id)
-        engine.setProperty("rate", RATE)
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
-    except Exception as error:                     # a voice problem should never crash Jarvis
+        if VOICE_ENGINE == "edge":
+            try:
+                speak_edge(text)
+                return
+            except Exception as error:          # no internet, or the packages are missing
+                print(f"(neural voice unavailable: {error}. Using the Windows voice instead.)")
+        speak_windows(text)
+    except Exception as error:                  # a voice problem should never crash Jarvis
         print(f"(voice unavailable: {error})")
 
 

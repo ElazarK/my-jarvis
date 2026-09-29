@@ -39,7 +39,9 @@ If Jarvis never hears you: Settings > Privacy & security > Microphone > allow de
 
 ## Settings
 
-All settings are at the top of `jarvis.py`: the model, the voice and speed, the language, the microphone sensitivity, and the optional Home Assistant connection.
+All settings are at the top of `jarvis.py`: the model, the voice, the language, the microphone sensitivity, and the optional Home Assistant connection.
+
+**Want a movie-style voice?** Set `VOICE_ENGINE = "edge"` (in `jarvis.py`, and in `step1_speak.py` to test it). That uses Microsoft's natural neural voices; the default `en-GB-RyanNeural` is a calm British male, `en-GB-ThomasNeural` is another good one. It needs an internet connection; if there is none, Jarvis falls back to the Windows voice automatically. `edge-tts` and `pygame` are installed by `requirements.txt`.
 
 ## Add your own tool
 
