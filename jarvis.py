@@ -58,7 +58,8 @@ SMART_HOME_DEVICES = {      # "what you call it": "Home Assistant entity id"
 SYSTEM_PROMPT = (
     f"You are {NAME}, a voice assistant running on the user's Windows PC. You are {PERSONALITY}. "
     "Your answers are read aloud, so keep them short: one to three sentences, plain text only, "
-    "no lists, no markdown, no emojis. Use a tool only when the request clearly needs it. "
+    "no lists, no markdown, no emojis. Use a tool only when the request clearly needs it; "
+    "when no tool is needed, simply answer in words and never write JSON. "
     f"Today is {datetime.date.today():%A, %d %B %Y}."
 )
 
@@ -286,6 +287,24 @@ def forget_old_messages(keep: int = 20) -> None:
             return
 
 
+def fake_tool_call(text: str):
+    """
+    Small models sometimes write a tool call as plain text instead of using the real
+    tool-calling channel, for example {"name": "None", "parameters": {}}.
+    Returns (tool_name, arguments) if the text looks like that, otherwise None.
+    """
+    text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(data, dict) and "name" in data:
+        return str(data.get("name")), data.get("parameters") or data.get("arguments") or {}
+    return None
+
+
 def think(user_text: str) -> str:
     """Send the user's words to the brain, run any tools it asks for, return the reply."""
     forget_old_messages()
@@ -295,8 +314,19 @@ def think(user_text: str) -> str:
         response = client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS)
         message = response.choices[0].message
 
-        if not message.tool_calls:                      # a normal answer - we're done
-            reply = (message.content or "").strip() or "I'm not sure what to say to that."
+        if not message.tool_calls:
+            reply = (message.content or "").strip()
+            fake = fake_tool_call(reply)
+            if fake and fake[0] in TOOL_FUNCTIONS:      # a real tool, asked for in the wrong way: run it anyway
+                name, arguments = fake
+                print(f"   [tool] {name} {json.dumps(arguments)}")
+                result = run_tool(name, arguments)
+                history.append({"role": "assistant", "content": reply})
+                history.append({"role": "user", "content": f"(Result of {name}: {result}) Now answer me in one or two plain sentences."})
+                continue
+            if fake or not reply:                       # no tool fits: ask again for a plain answer, without tools
+                response = client.chat.completions.create(model=MODEL, messages=history)
+                reply = (response.choices[0].message.content or "").strip() or "I'm not sure what to say to that."
             history.append({"role": "assistant", "content": reply})
             return reply
 
