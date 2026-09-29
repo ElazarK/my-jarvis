@@ -67,7 +67,7 @@ Three moves, all inside `jarvis.py`. Example: a tool that reads back your saved 
 3. Add one line to the `TOOLS` list describing it in plain English:
 
    ```python
-   tool("read_notes", "Read back the notes the user saved earlier."),
+   tool("read_notes", "Read back the notes the user saved earlier. Use when the user asks what their notes are or to read their notes."),
    ```
 
 Restart Jarvis and say "What are my notes?". The brain reads the description and starts using your tool when it makes sense.

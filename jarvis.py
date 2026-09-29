@@ -245,11 +245,11 @@ def tool(name: str, description: str, **params: str) -> dict:
 
 
 TOOLS = [
-    tool("get_current_time", "Get the current date and time."),
-    tool("get_weather", "Get the current weather for a city.", city="City name, for example Tel Aviv"),
-    tool("open_website", "Open a website in the user's browser.", url="Full address, for example https://www.youtube.com"),
-    tool("search_web", "Search the internet in the user's browser.", query="What to search for"),
-    tool("save_note", "Save a short note for the user.", text="The note to save"),
+    tool("get_current_time", "Get the current date and time. Use when the user asks what time or what day it is."),
+    tool("get_weather", "Get the current weather for a city. Use whenever the user asks about weather, temperature or rain.", city="City name, for example Tel Aviv"),
+    tool("open_website", "Open a website in the user's browser. Use when the user says open, go to or show me a site.", url="Full address, for example https://www.youtube.com"),
+    tool("search_web", "Search the internet in the user's browser. Use when the user says search, look up or google something.", query="What to search for"),
+    tool("save_note", "Save a short note for the user. Use when the user says save a note, remember this or write this down.", text="The note to save"),
 ]
 if HA_URL and HA_TOKEN and SMART_HOME_DEVICES:
     TOOLS.append(tool("smart_home", "Turn a smart home device on or off.",
@@ -309,8 +309,9 @@ def think(user_text: str) -> str:
     """Send the user's words to the brain, run any tools it asks for, return the reply."""
     forget_old_messages()
     history.append({"role": "user", "content": user_text})
+    nudge_at = None                                     # where the nudge messages sit, so we can remove them later
 
-    for _ in range(5):                                  # allow a few tool calls in a row
+    for _ in range(6):                                  # allow a few tool calls in a row
         response = client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS)
         message = response.choices[0].message
 
@@ -324,9 +325,16 @@ def think(user_text: str) -> str:
                 history.append({"role": "assistant", "content": reply})
                 history.append({"role": "user", "content": f"(Result of {name}: {result}) Now answer me in one or two plain sentences."})
                 continue
-            if fake or not reply:                       # no tool fits: ask again for a plain answer, without tools
-                response = client.chat.completions.create(model=MODEL, messages=history)
+            if fake or not reply:                       # not an answer at all
+                if nudge_at is None:                    # first: give the brain a second chance, tools included
+                    nudge_at = len(history)
+                    history.append({"role": "assistant", "content": reply or "..."})
+                    history.append({"role": "user", "content": "(That was not an answer. If one of your tools fits my request, call it properly now. Otherwise answer me in plain words, never JSON.)"})
+                    continue
+                response = client.chat.completions.create(model=MODEL, messages=history)   # last resort: plain answer, no tools
                 reply = (response.choices[0].message.content or "").strip() or "I'm not sure what to say to that."
+            if nudge_at is not None:                    # drop the nudge chatter, keep everything real
+                del history[nudge_at:nudge_at + 2]
             history.append({"role": "assistant", "content": reply})
             return reply
 
