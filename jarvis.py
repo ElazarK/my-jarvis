@@ -8,12 +8,16 @@ JARVIS - a voice assistant that runs on your own Windows PC.
 
 Run:   python jarvis.py
 Press Enter to talk, or type a message instead. Say "goodbye" to stop.
+
+Hands-free: set WAKE_WORD = True below and say "Hey Jarvis" instead of pressing Enter (Step 9 of the guide).
+A face:     run  python jarvis_hud.py  for a window that shows what Jarvis hears and says (Step 10).
 """
 import datetime
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -47,6 +51,11 @@ LANGUAGE = "en"             # "he" = Hebrew, "es" = Spanish, "fr" = French ... o
 THRESHOLD = None            # microphone sensitivity. None = measure automatically at start-up
 SAMPLE_RATE = 16000
 
+# Hands-free (Step 9). Needs:  pip install openwakeword
+WAKE_WORD = False           # True = no Enter key: say "Hey Jarvis" and then talk, like a smart speaker
+WAKE_SENSITIVITY = 0.5      # how sure Jarvis must be that it heard its name: 0.3 = eager, 0.7 = strict
+FOLLOW_UP_SECONDS = 8       # after an answer Jarvis keeps listening this long, so you can reply without the wake word
+
 # Optional: smart home control through Home Assistant. Leave empty to skip.
 HA_URL = ""                 # for example "http://homeassistant.local:8123"
 HA_TOKEN = ""               # a Long-Lived Access Token from your Home Assistant profile page
@@ -62,6 +71,24 @@ SYSTEM_PROMPT = (
     "when no tool is needed, simply answer in words and never write JSON. "
     f"Today is {datetime.date.today():%A, %d %B %Y}."
 )
+
+# =====================================================================
+#  EVENTS - how other windows (the HUD in jarvis_hud.py) follow what Jarvis is doing
+# =====================================================================
+listeners = []                      # functions that want to be told what is happening: listener(event, value)
+talk_now = threading.Event()        # another window can set this to say "listen to me now" (the HUD's Space key)
+STOP = False                        # another window sets this to True to make Jarvis shut down cleanly
+
+
+def notify(event: str, value="") -> None:
+    """Tell every listener what is happening. Events: state (standby, listening, thinking, speaking, off),
+    you (what you said), jarvis (what Jarvis says), tool (which tool runs), level (how loud you are), info."""
+    for listener in list(listeners):
+        try:
+            listener(event, value)
+        except Exception:
+            pass                                    # a display problem must never stop Jarvis
+
 
 # =====================================================================
 #  1. VOICE
@@ -97,6 +124,8 @@ def speak_edge(text: str) -> None:
 def speak(text: str) -> None:
     """Say the text out loud (and print it) with whichever voice engine is selected."""
     print(f"{NAME}: {text}")
+    notify("jarvis", text)
+    notify("state", "speaking")
     try:
         if VOICE_ENGINE == "edge":
             try:
@@ -107,6 +136,18 @@ def speak(text: str) -> None:
         speak_windows(text)
     except Exception as error:                  # a voice problem should never crash Jarvis
         print(f"(voice unavailable: {error})")
+
+
+def chime() -> None:
+    """A short two-note sound that means 'I heard my name, go ahead'. Made from numbers, no file needed."""
+    try:
+        t = np.linspace(0, 0.09, int(SAMPLE_RATE * 0.09), endpoint=False)
+        fade = np.linspace(1, 0, t.size)
+        tone = np.concatenate([np.sin(2 * np.pi * f * t) * fade for f in (880, 1320)]) * 0.25
+        sd.play(tone.astype("float32"), SAMPLE_RATE)
+        sd.wait()
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -142,7 +183,9 @@ def record(threshold: float, max_seconds: float = 15, silence_seconds: float = 1
             frames.append(data)
             elapsed += chunk_seconds
 
-            if loudness(data) > threshold:
+            level = loudness(data)
+            notify("level", level / threshold if threshold else 0.0)
+            if level > threshold:
                 heard_speech, quiet_time = True, 0.0
             else:
                 quiet_time += chunk_seconds
@@ -155,14 +198,75 @@ def record(threshold: float, max_seconds: float = 15, silence_seconds: float = 1
     return np.concatenate(frames) if heard_speech else None
 
 
-def listen(threshold: float) -> str:
-    """Record one sentence and return it as text ("" if nothing was heard)."""
-    print("Listening... (speak now)")
-    audio = record(threshold)
-    if audio is None:
-        return ""
+def transcribe(audio) -> str:
+    """Turn recorded audio into text."""
     segments, _ = whisper.transcribe(audio, language=LANGUAGE, beam_size=1, vad_filter=True)
     return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def listen(threshold: float, wait_seconds: float = 6, prompt: str = "Listening... (speak now)") -> str:
+    """Record one sentence and return it as text ("" if nothing was heard)."""
+    print(prompt)
+    notify("state", "listening")
+    audio = record(threshold, wait_seconds=wait_seconds)
+    if audio is None:
+        return ""
+    return transcribe(audio)
+
+
+# =====================================================================
+#  2b. WAKE WORD - "Hey Jarvis" instead of the Enter key (Step 9). Needs the openwakeword package.
+# =====================================================================
+def load_wake_word_model():
+    """Loads the ready-made 'hey jarvis' model from openWakeWord. Returns None if that is not possible."""
+    try:
+        import openwakeword
+        import openwakeword.utils
+        from openwakeword.model import Model
+    except ImportError:
+        print("(the openwakeword package is not installed. Run:  pip install openwakeword  and start me again.)")
+        return None
+    try:
+        openwakeword.utils.download_models(model_names=["hey_jarvis"])   # first run only: a few small files
+        return Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+    except Exception as error:
+        print(f"(the wake word is not available: {error})")
+        return None
+
+
+def wait_for_wake_word(model) -> bool:
+    """Listen to the room in 80 ms slices until you say 'Hey Jarvis'.
+    Returns True when the name was heard (or talk_now was set), False when STOP was requested."""
+    frame = 1280                                        # 80 ms at 16 kHz, the slice openWakeWord expects
+    model.reset()                                       # forget older sound, including Jarvis's own voice
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=frame) as stream:
+        while not STOP:
+            if talk_now.is_set():                       # the HUD's Space key works in this mode too
+                talk_now.clear()
+                return True
+            data, _ = stream.read(frame)
+            score = max(model.predict(data[:, 0]).values())
+            if score >= WAKE_SENSITIVITY:
+                print(f"(heard my name, score {score:.2f})")
+                return True
+    return False
+
+
+def wait_for_enter():
+    """The classic way: press Enter to talk, or type a message. Returns the typed text ("" = listen)."""
+    try:
+        return input("\n> ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None                                     # None = shut down
+
+
+def wait_for_signal():
+    """Wait until another window (the HUD) sets talk_now, for example when you press Space there."""
+    while not STOP:
+        if talk_now.wait(0.1):
+            talk_now.clear()
+            return ""
+    return None
 
 
 # =====================================================================
@@ -307,6 +411,7 @@ def fake_tool_call(text: str):
 
 def think(user_text: str) -> str:
     """Send the user's words to the brain, run any tools it asks for, return the reply."""
+    notify("state", "thinking")
     forget_old_messages()
     history.append({"role": "user", "content": user_text})
     nudge_at = None                                     # where the nudge messages sit, so we can remove them later
@@ -321,6 +426,7 @@ def think(user_text: str) -> str:
             if fake and fake[0] in TOOL_FUNCTIONS:      # a real tool, asked for in the wrong way: run it anyway
                 name, arguments = fake
                 print(f"   [tool] {name} {json.dumps(arguments)}")
+                notify("tool", f"{name} {json.dumps(arguments)}")
                 result = run_tool(name, arguments)
                 history.append({"role": "assistant", "content": reply})
                 history.append({"role": "user", "content": f"(Result of {name}: {result}) Now answer me in one or two plain sentences."})
@@ -348,16 +454,65 @@ def think(user_text: str) -> str:
         })
         for call in message.tool_calls:                 # run each tool and report back
             print(f"   [tool] {call.function.name} {call.function.arguments}")
+            notify("tool", f"{call.function.name} {call.function.arguments}")
             result = run_tool(call.function.name, call.function.arguments)
             history.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
     return "I got a bit lost there. Could you ask that in a different way?"
 
 
+def safe_think(user_text: str) -> str:
+    """think(), but every problem becomes a spoken sentence instead of a crash."""
+    try:
+        return think(user_text)
+    except APIConnectionError:
+        return "I can't reach my brain. Please make sure the Ollama app is running. Look for the llama icon in the system tray."
+    except NotFoundError:
+        return f"The model {MODEL} is not installed. Run: ollama pull {MODEL}"
+    except Exception as error:
+        return f"Something went wrong: {error}"
+
+
 # =====================================================================
 #  5. THE LOOP - ears -> brain -> hands -> voice, again and again
 # =====================================================================
-def main() -> None:
+QUIT_WORDS = ("exit", "quit", "shut down", "shutdown", "power off")           # close the program
+GOODBYE_WORDS = ("goodbye", "bye", "stop", "that's all", "that is all")   # end the conversation (hands-free: back to standby)
+
+
+def converse(user_text: str, threshold: float, follow_up_seconds: float, hands_free: bool) -> str:
+    """Answer one request, then (hands-free) keep listening for follow-ups.
+    Returns "quit" when Jarvis should close, otherwise "done"."""
+    while True:
+        print(f"You: {user_text}")
+        notify("you", user_text)
+        words = user_text.lower().strip(" .!?,")
+
+        if words in QUIT_WORDS or (words in GOODBYE_WORDS and not hands_free):
+            speak("Goodbye!")
+            return "quit"
+        if words in GOODBYE_WORDS:                      # hands-free: back to waiting for the wake word
+            speak("Very good. I'll be here if you need me.")
+            return "done"
+
+        speak(safe_think(user_text))
+
+        if follow_up_seconds <= 0:
+            return "done"
+        try:                                            # a follow-up needs no wake word
+            user_text = listen(threshold, wait_seconds=follow_up_seconds,
+                               prompt=f"(still listening for {follow_up_seconds:g} seconds, no need to say Hey {NAME})")
+        except Exception as error:
+            print(f"(microphone problem: {error})")
+            return "done"
+        if not user_text:
+            return "done"
+
+
+def main(wait_for_user=None) -> None:
+    """wait_for_user decides how a conversation starts. It blocks until it is your turn and returns
+    typed text, "" to listen through the microphone, or None to shut down. Default: the Enter key.
+    With WAKE_WORD = True the wake word takes over. The HUD passes wait_for_signal (its Space key)."""
     print(f"\n{NAME} is starting up...")
     threshold = THRESHOLD
     if threshold is None:
@@ -368,18 +523,41 @@ def main() -> None:
             print(f"(microphone problem: {error} - you can still type to me)")
             threshold = 0.01
 
-    speak(f"Hello, I am {NAME}. How can I help?")
-    print("\nPress Enter to talk, or type a message and press Enter. Say 'goodbye' to stop.")
+    wake_model = load_wake_word_model() if WAKE_WORD else None
+    if wake_model is not None:
+        hands_free = True
+        wait_for_user = lambda: ("" if wait_for_wake_word(wake_model) else None)
+        how_to_talk = f'Say "Hey {NAME}", wait for the chime, then talk. Say "goodbye" to end a chat, "shut down" to close me.'
+    elif wait_for_user is None:
+        hands_free = False
+        wait_for_user = wait_for_enter
+        how_to_talk = "Press Enter to talk, or type a message and press Enter. Say 'goodbye' to stop."
+    else:
+        hands_free = True                               # another window (the HUD) tells us when to listen
+        how_to_talk = "Press Space in the window to talk. Say 'goodbye' to end a chat, 'shut down' to close me."
 
-    while True:
+    speak(f"Hello, I am {NAME}. How can I help?")
+    print("\n" + how_to_talk)
+    notify("info", how_to_talk)
+
+    while not STOP:
+        notify("state", "standby")
         try:
-            typed = input("\n> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            typed = "goodbye"
+            typed = wait_for_user()
+        except KeyboardInterrupt:
+            typed = None
+        except Exception as error:
+            print(f"(microphone problem: {error})")
+            time.sleep(1)
+            continue
+        if typed is None:
+            break
 
         if typed:
             user_text = typed
         else:
+            if hands_free and wake_model is not None:
+                chime()
             try:
                 user_text = listen(threshold)
             except Exception as error:
@@ -389,21 +567,11 @@ def main() -> None:
         if not user_text:
             print("I didn't catch that. Try again, a little louder.")
             continue
-        print(f"You: {user_text}")
 
-        if user_text.lower().strip(" .!?") in ("goodbye", "bye", "exit", "quit", "stop"):
-            speak("Goodbye!")
+        if converse(user_text, threshold, FOLLOW_UP_SECONDS if hands_free else 0, hands_free) == "quit":
             break
 
-        try:
-            reply = think(user_text)
-        except APIConnectionError:
-            reply = "I can't reach my brain. Please make sure the Ollama app is running. Look for the llama icon in the system tray."
-        except NotFoundError:
-            reply = f"The model {MODEL} is not installed. Run: ollama pull {MODEL}"
-        except Exception as error:
-            reply = f"Something went wrong: {error}"
-        speak(reply)
+    notify("state", "off")
 
 
 if __name__ == "__main__":

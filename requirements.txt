@@ -2,8 +2,9 @@
 sounddevice>=0.5        # talks to your microphone (PortAudio is included in the Windows package)
 numpy                   # handles the audio numbers
 faster-whisper>=1.1     # speech-to-text, runs on your own PC (downloads a model on first use)
-pyttsx3>=2.98           # text-to-speech using the voices built into Windows
-edge-tts>=7.0           # optional neural text-to-speech voices from Microsoft Edge
-pygame>=2.5             # plays the temporary neural voice audio file
+pyttsx3>=2.98           # text-to-speech using the voices built into Windows (works offline)
 openai>=1.50            # the client library we use to talk to Ollama (the local AI brain)
 requests                # simple web requests (weather, Home Assistant)
+edge-tts>=7.0           # optional: Microsoft's natural neural voices (set VOICE_ENGINE = "edge"; needs internet)
+pygame>=2.5             # optional: plays the neural voice's audio
+# Step 9 (hands-free "Hey Jarvis") needs one more package. Install it when you get there:   pip install openwakeword
