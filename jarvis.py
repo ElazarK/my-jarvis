@@ -524,19 +524,42 @@ def forget_old_messages(keep: int = 20) -> None:
 def fake_tool_call(text: str):
     """
     Small models sometimes write a tool call as plain text instead of using the real
-    tool-calling channel, for example {"name": "None", "parameters": {}}.
-    Returns (tool_name, arguments) if the text looks like that, otherwise None.
+    tool-calling channel, for example {"name": "None", "parameters": {}} or the same
+    thing wrapped in a code fence.
+    Returns (tool_name, arguments) if the text holds a call like that, otherwise None.
     """
-    text = text.strip()
-    if not (text.startswith("{") and text.endswith("}")):
+    text = text.strip().strip("`").strip()
+    if text.lower().startswith("json"):
+        text = text[4:].strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end < start:
         return None
     try:
-        data = json.loads(text)
+        data = json.loads(text[start:end + 1])
     except ValueError:
         return None
     if isinstance(data, dict) and "name" in data:
         return str(data.get("name")), data.get("parameters") or data.get("arguments") or {}
     return None
+
+
+def named_tool(text: str):
+    """The tool name inside a tool call written out as text, even a broken one. None if there is none."""
+    match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+    return match.group(1) if match else None
+
+
+def looks_like_code(text: str) -> bool:
+    """
+    True when a reply is JSON or code rather than a sentence, even a half-finished one:
+    it opens with a brace, a bracket or a code fence, or it carries the tell-tale
+    "name": / "parameters": of a tool call written out as text. Such a reply must
+    never be read aloud.
+    """
+    text = text.strip()
+    return (text.startswith(("{", "[", "```", "<|"))
+            or re.search(r'"(name|parameters|arguments|function|tool_calls?)"\s*:', text) is not None
+            or "<function" in text)
 
 
 last_action = {"key": None, "result": ""}     # the most recent action in this conversation, so a comment does not repeat it
@@ -591,7 +614,8 @@ def perform(name: str, arguments, user_text: str, done_this_turn: set):
         print(f"   [tool] {name} skipped: the user did not ask for it")
         notify("tool", f"{name} (not asked for)")
         return (f'(Not done: the user did not ask for {name}. Their exact words were: "{user_text}". '
-                "Reply to those words in plain language, without any tool.)"), True
+                "Reply to those words yourself, from what you know, in one or two plain sentences. "
+                "Do not mention tools, searching, or this note.)"), True
     shown = arguments if isinstance(arguments, str) else json.dumps(arguments)
     print(f"   [tool] {name} {shown}")
     notify("tool", f"{name} {shown}")
@@ -618,7 +642,8 @@ def think(user_text: str) -> str:
     def answer_in_words(fallback: str) -> str:
         """Ask the brain once more, with no tools on offer, so the answer has to be a sentence."""
         response = client.chat.completions.create(model=MODEL, messages=history)
-        return finish((response.choices[0].message.content or "").strip() or fallback)
+        reply = (response.choices[0].message.content or "").strip()
+        return finish(fallback if not reply or looks_like_code(reply) else reply)
 
     for _ in range(6):                                  # allow a few tool calls in a row
         response = client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS)
@@ -635,11 +660,18 @@ def think(user_text: str) -> str:
                 if repeated:
                     return answer_in_words("That is already done.")
                 continue
-            if fake or not reply:                       # not an answer at all
+            if fake or not reply or looks_like_code(reply):   # not an answer at all
                 if nudge_at is None:                    # first: give the brain a second chance, tools included
                     nudge_at = len(history)
                     history.append({"role": "assistant", "content": reply or "..."})
-                    history.append({"role": "user", "content": "(That was not an answer. If one of your tools fits my request, call it properly now. Otherwise answer me in plain words, never JSON.)"})
+                    name = fake[0] if fake else named_tool(reply)
+                    if name in TOOL_FUNCTIONS:
+                        no_such_tool = f"Call the {name} tool properly, through the tool channel, not as text. "
+                    elif name and name != "None":
+                        no_such_tool = f"There is no tool called {name}. "
+                    else:
+                        no_such_tool = ""
+                    history.append({"role": "user", "content": f"(That was not an answer. {no_such_tool}If one of your tools fits my request, call it properly now. Otherwise answer me in plain words, never JSON.)"})
                     continue
                 return answer_in_words("I'm not sure what to say to that.")   # last resort: plain answer, no tools
             return finish(reply)
