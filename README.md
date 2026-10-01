@@ -2,11 +2,15 @@
 
 A voice assistant that runs 100% on your own Windows PC. Free, private, no API keys, no monthly fees.
 
+![Jarvis HUD demo: the glowing core breathes in standby, lights up when it hears "Hey Jarvis", and pulses while it answers](docs/jarvis-hud-demo.gif)
+
+*The face from the HUD step (`jarvis_hud.py`): say "Hey Jarvis" and it wakes up, listens, thinks and answers.*
+
 | Part  | What it does                                        | Made with                                   |
 |-------|-----------------------------------------------------|---------------------------------------------|
 | Ears  | turns your speech into text                         | faster-whisper (runs locally)               |
 | Brain | understands you and decides what to do              | Ollama + llama3.2 (runs locally)            |
-| Hands | does things: time, weather, web, notes, smart home  | small Python functions ("tools")            |
+| Hands | does things: time, weather, web, notes, maths, smart home | small Python functions ("tools"), plus skills it writes itself |
 | Voice | reads the answer out loud                           | the voices built into Windows               |
 
 ## Files
@@ -36,13 +40,13 @@ A voice assistant that runs 100% on your own Windows PC. Free, private, no API k
    `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 
 3. Run the steps in order: `python step1_speak.py`, `python step2_listen.py`, `python step3_brain.py`, then `python jarvis.py`.
-4. Optional extras, in this order: hands-free (below), then the face (below).
+4. Optional extras, in this order: hands-free (below), the face, manners, and skills it learns on its own (all below).
 
 If Jarvis never hears you: Settings > Privacy & security > Microphone > allow desktop apps to access your microphone.
 
 ## Settings
 
-All settings are at the top of `jarvis.py`: the model, the voice, the language, the microphone sensitivity, the wake word, and the optional Home Assistant connection.
+All settings are at the top of `jarvis.py`: the model, the voice, the language, the microphone sensitivity, the wake word, the form of address, learning, and the optional Home Assistant connection.
 
 **Want a movie-style voice?** Set `VOICE_ENGINE = "edge"` (in `jarvis.py`, and in `step1_speak.py` to test it). That uses Microsoft's natural neural voices; the default `en-GB-RyanNeural` is a calm British male, `en-GB-ThomasNeural` is another good one. It needs an internet connection; if there is none, Jarvis falls back to the Windows voice automatically. `edge-tts` and `pygame` are installed by `requirements.txt`.
 
@@ -75,6 +79,45 @@ rotating rings, drifting particles, a clock, and read-outs of the brain, ears an
 while you work: the moment Jarvis hears its name the window jumps to the front, on top of everything, and steps back
 when the conversation ends (`POP_UP_ON_WAKE`). All your settings and tools carry over, because the window simply runs
 `jarvis.py` underneath. Window size, colours and an always-on-top option are at the top of `jarvis_hud.py`.
+
+## Manners: "Yes, sir"
+
+`ADDRESS_AS = "sir"` makes Jarvis talk the way a well-trained butler would: "Good morning, sir. Jarvis at your service.",
+"Right away, sir.", "Very good, sir." It is formal, brief and understated, with the odd dry remark, and it never uses
+exclamation marks. Change it to `"ma'am"`, to your first name, or to `""` for no title at all. The tone itself is the
+`PERSONALITY` line; rewrite it for a different character. For the voice to match, set `VOICE_ENGINE = "edge"` (above).
+
+## Skills: Jarvis writes new tools for itself
+
+Ask Jarvis something none of its tools can do, and the small brain often reaches for a tool that does not exist.
+With `LEARNING = True` Jarvis turns that into a lesson: "I don't have a skill for that yet, sir. Shall I write one?"
+Say yes and the brain writes a small Python file, Jarvis checks it, tests it and keeps it, then answers your question
+with it. From then on the skill is simply one of its tools, every time it starts. You can also ask outright:
+"Jarvis, learn how to convert gallons to litres."
+
+What keeps this safe:
+
+- A skill may only use harmless parts of Python (maths, dates, text, random numbers): no files, no network, no running
+  other programs. Jarvis reads the code before anything runs and rejects it otherwise (`ALLOWED_MODULES`).
+- Every skill carries its own self-test, which runs in a separate process with a time limit. Only a skill that passes is kept.
+- Nothing is written until you say yes (`ASK_BEFORE_LEARNING`), and the terminal shows every attempt.
+- Each skill is a small plain-text file in the `skills` folder. Open it and read it; delete it to forget the skill.
+
+The brain gets three attempts; if none passes, Jarvis says so and moves on. A bigger model (`llama3.1:8b`,
+`qwen2.5:7b`) writes far better skills than `llama3.2`. `LEARNING = False` switches the whole thing off.
+
+## Make it faster
+
+After each answer the terminal prints where the time went: `(ears 1.2 s, brain 2.4 s, voice ready in 0.9 s)`
+(`SHOW_TIMINGS`). Then:
+
+- Ears: `WHISPER_SIZE = "base"` is about twice as fast as `"small"`; `"tiny"` faster still, at the cost of accuracy.
+  `PAUSE_SECONDS` is how long you must be quiet before Jarvis decides you have finished (1.0 by default; 0.7 feels snappier).
+- Brain: Jarvis loads the model while the ears load and keeps it in memory, so the first answer and the answers after a
+  quiet spell are no slower than the rest. A PC with an NVIDIA graphics card runs Ollama many times faster automatically.
+  Every tool call costs one extra round trip to the brain, so a plain question is always quicker than one that needs a tool.
+- Voice: the neural voice is fetched sentence by sentence, so the first sentence plays while the next is prepared.
+  The Windows voice is instant, offline, and still the fastest option.
 
 ## Add your own tool
 
