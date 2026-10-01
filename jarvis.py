@@ -12,9 +12,11 @@ Press Enter to talk, or type a message instead. Say "goodbye" to stop.
 Hands-free: set WAKE_WORD = True below and say "Hey Jarvis" instead of pressing Enter (Step 9 of the guide).
 A face:     run  python jarvis_hud.py  for a window that shows what Jarvis hears and says (Step 10).
 """
+import collections
 import datetime
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -55,6 +57,8 @@ SAMPLE_RATE = 16000
 WAKE_WORD = False           # True = no Enter key: say "Hey Jarvis" and then talk, like a smart speaker
 WAKE_SENSITIVITY = 0.5      # how sure Jarvis must be that it heard its name: 0.3 = eager, 0.7 = strict
 FOLLOW_UP_SECONDS = 8       # after an answer Jarvis keeps listening this long, so you can reply without the wake word
+INTERRUPTIBLE = True        # True = say "Hey Jarvis" (or press Space in the window, or Enter in the terminal) while Jarvis
+                            #        is talking and it stops mid-sentence and listens to you
 
 # Optional: smart home control through Home Assistant. Leave empty to skip.
 HA_URL = ""                 # for example "http://homeassistant.local:8123"
@@ -68,7 +72,9 @@ SYSTEM_PROMPT = (
     f"You are {NAME}, a voice assistant running on the user's Windows PC. You are {PERSONALITY}. "
     "Your answers are read aloud, so keep them short: one to three sentences, plain text only, "
     "no lists, no markdown, no emojis. Use a tool only when the request clearly needs it; "
-    "when no tool is needed, simply answer in words and never write JSON. "
+    "when no tool is needed, simply answer in words and never write JSON. Do each action once: "
+    "if the user comments on what you just did, or thanks you, reply briefly in words instead of doing it again; "
+    "repeat an action only when the user clearly asks for it again. "
     f"Today is {datetime.date.today():%A, %d %B %Y}."
 )
 
@@ -93,39 +99,76 @@ def notify(event: str, value="") -> None:
 # =====================================================================
 #  1. VOICE
 # =====================================================================
+interrupted = threading.Event()     # set by interrupt(): Jarvis stops talking and listens
+speaking = threading.Event()        # set while Jarvis is talking (the wake-word watcher and the HUD read it)
+
+
+def interrupt() -> None:
+    """Cut Jarvis off mid-sentence. Called when you say the wake word or press Space while it talks."""
+    if speaking.is_set():
+        interrupted.set()
+
+
+def play_file(path: str) -> None:
+    """Play a sound file through pygame and wait, stopping at once if interrupt() is called."""
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    import pygame
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
+    if path.lower().endswith(".wav"):                   # the Windows voice: a sound object converts the format for us
+        channel = pygame.mixer.Sound(path).play()
+        while channel is not None and channel.get_busy():
+            if interrupted.is_set():
+                channel.stop()
+                break
+            time.sleep(0.03)
+        return
+    pygame.mixer.music.load(path)                       # the neural voice: an mp3 stream
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        if interrupted.is_set():
+            pygame.mixer.music.stop()
+            break
+        time.sleep(0.03)
+    pygame.mixer.music.unload()
+
+
 def speak_windows(text: str) -> None:
-    """The voices built into Windows. Works offline."""
+    """The voices built into Windows. Works offline. The speech is written to a small sound file first and
+    played from there, so that it can be cut off when you interrupt (a live Windows voice cannot be)."""
     engine = pyttsx3.init()
     voices = engine.getProperty("voices")
     if voices and VOICE < len(voices):
         engine.setProperty("voice", voices[VOICE].id)
     engine.setProperty("rate", RATE)
-    engine.say(text)
-    engine.runAndWait()
-    engine.stop()
+    path = os.path.join(tempfile.gettempdir(), "jarvis_voice.wav")
+    try:
+        engine.save_to_file(text, path)
+        engine.runAndWait()
+        engine.stop()
+        play_file(path)
+    except Exception:                               # no pygame, or the file route failed: speak live, uninterruptible
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
 
 
 def speak_edge(text: str) -> None:
     """Microsoft's neural voices through the edge-tts package. Needs internet."""
-    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     import edge_tts
-    import pygame
     path = os.path.join(tempfile.gettempdir(), "jarvis_voice.mp3")
     edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE, pitch=EDGE_PITCH).save_sync(path)
-    if not pygame.mixer.get_init():
-        pygame.mixer.init()
-    pygame.mixer.music.load(path)
-    pygame.mixer.music.play()
-    while pygame.mixer.music.get_busy():
-        time.sleep(0.05)
-    pygame.mixer.music.unload()
+    play_file(path)
 
 
 def speak(text: str) -> None:
-    """Say the text out loud (and print it) with whichever voice engine is selected."""
+    """Say the text out loud (and print it) with whichever voice engine is selected.
+    Sets `interrupted` if you cut it off; the caller decides what to do about that."""
     print(f"{NAME}: {text}")
     notify("jarvis", text)
     notify("state", "speaking")
+    interrupted.clear()
+    speaking.set()
     try:
         if VOICE_ENGINE == "edge":
             try:
@@ -136,16 +179,22 @@ def speak(text: str) -> None:
         speak_windows(text)
     except Exception as error:                  # a voice problem should never crash Jarvis
         print(f"(voice unavailable: {error})")
+    finally:
+        speaking.clear()
+        if interrupted.is_set():
+            print("(interrupted)")
 
 
-def chime() -> None:
-    """A short two-note sound that means 'I heard my name, go ahead'. Made from numbers, no file needed."""
+def chime(wait: bool = True) -> None:
+    """A short two-note sound that means 'I heard my name, go ahead'. Made from numbers, no file needed.
+    wait=False plays it in the background so Jarvis can keep listening while it sounds."""
     try:
         t = np.linspace(0, 0.09, int(SAMPLE_RATE * 0.09), endpoint=False)
         fade = np.linspace(1, 0, t.size)
-        tone = np.concatenate([np.sin(2 * np.pi * f * t) * fade for f in (880, 1320)]) * 0.25
+        tone = np.concatenate([np.sin(2 * np.pi * f * t) * fade for f in (880, 1320)]) * 0.18
         sd.play(tone.astype("float32"), SAMPLE_RATE)
-        sd.wait()
+        if wait:
+            sd.wait()
     except Exception:
         pass
 
@@ -169,33 +218,43 @@ def measure_background_noise(seconds: float = 1.0) -> float:
     return loudness(audio)
 
 
+def collect_speech(read_chunk, chunk_seconds: float, threshold: float, max_seconds: float = 15,
+                   silence_seconds: float = 1.2, wait_seconds: float = 6, start_with=(), ignore_seconds: float = 0.0):
+    """The listening rule shared by every way of talking to Jarvis: keep taking small chunks of sound
+    until you have spoken and then gone quiet. read_chunk() returns one chunk as 1-D float32 audio.
+    start_with = sound to keep in front of the recording (what was said just before the wake word was
+    recognised). ignore_seconds = how long at the start to ignore loudness (while the chime plays).
+    Returns the audio, or None if nobody spoke."""
+    frames, heard_speech, quiet_time, elapsed = list(start_with), False, 0.0, 0.0
+    while elapsed < max_seconds:
+        data = read_chunk()
+        frames.append(data)
+        elapsed += chunk_seconds
+        if elapsed <= ignore_seconds:
+            continue
+
+        level = loudness(data)
+        notify("level", level / threshold if threshold else 0.0)
+        if level > threshold:
+            heard_speech, quiet_time = True, 0.0
+        else:
+            quiet_time += chunk_seconds
+
+        if heard_speech and quiet_time >= silence_seconds:
+            break                                       # you finished your sentence
+        if not heard_speech and elapsed >= wait_seconds + ignore_seconds:
+            break                                       # nobody spoke
+    return np.concatenate(frames) if heard_speech else None
+
+
 def record(threshold: float, max_seconds: float = 15, silence_seconds: float = 1.2,
            wait_seconds: float = 6):
     """Record from the microphone until you stop talking. Returns None if nobody spoke."""
     chunk_seconds = 0.1
     chunk = int(SAMPLE_RATE * chunk_seconds)
-    frames, heard_speech, quiet_time, elapsed = [], False, 0.0, 0.0
-
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=chunk) as stream:
-        while elapsed < max_seconds:
-            data, _ = stream.read(chunk)
-            data = data[:, 0]
-            frames.append(data)
-            elapsed += chunk_seconds
-
-            level = loudness(data)
-            notify("level", level / threshold if threshold else 0.0)
-            if level > threshold:
-                heard_speech, quiet_time = True, 0.0
-            else:
-                quiet_time += chunk_seconds
-
-            if heard_speech and quiet_time >= silence_seconds:
-                break                                   # you finished your sentence
-            if not heard_speech and elapsed >= wait_seconds:
-                break                                   # nobody spoke
-
-    return np.concatenate(frames) if heard_speech else None
+        return collect_speech(lambda: stream.read(chunk)[0][:, 0], chunk_seconds, threshold,
+                              max_seconds, silence_seconds, wait_seconds)
 
 
 def transcribe(audio) -> str:
@@ -234,22 +293,93 @@ def load_wake_word_model():
         return None
 
 
-def wait_for_wake_word(model) -> bool:
-    """Listen to the room in 80 ms slices until you say 'Hey Jarvis'.
-    Returns True when the name was heard (or talk_now was set), False when STOP was requested."""
-    frame = 1280                                        # 80 ms at 16 kHz, the slice openWakeWord expects
+WAKE_FRAME = 1280           # 80 ms at 16 kHz, the slice openWakeWord expects
+PRE_ROLL_SECONDS = 0.4      # sound kept from just before the name was recognised, so a fast first word is not lost
+CHIME_SECONDS = 0.3         # how long the chime is ignored by the "did somebody speak" rule
+
+
+def wait_for_wake_word(model, stream, pre_roll) -> bool:
+    """Read 80 ms slices from the open microphone stream until you say 'Hey Jarvis' (or talk_now is set).
+    The last slices are kept in pre_roll. Returns False when STOP was requested."""
     model.reset()                                       # forget older sound, including Jarvis's own voice
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=frame) as stream:
-        while not STOP:
-            if talk_now.is_set():                       # the HUD's Space key works in this mode too
-                talk_now.clear()
-                return True
-            data, _ = stream.read(frame)
-            score = max(model.predict(data[:, 0]).values())
-            if score >= WAKE_SENSITIVITY:
-                print(f"(heard my name, score {score:.2f})")
-                return True
+    while not STOP:
+        if talk_now.is_set():                           # the HUD's Space key works in this mode too
+            talk_now.clear()
+            pre_roll.clear()                            # nothing useful was said before a key press
+            return True
+        data, _ = stream.read(WAKE_FRAME)
+        pre_roll.append(data[:, 0])
+        score = max(model.predict(data[:, 0]).values())
+        if score >= WAKE_SENSITIVITY:
+            print(f"(heard my name, score {score:.2f})")
+            return True
     return False
+
+
+def watch_for_interruption(model):
+    """Runs on its own thread while Jarvis talks: if you say the wake word (or press Space), it cuts the voice."""
+    try:
+        pre_roll = collections.deque(maxlen=1)
+        model.reset()
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=WAKE_FRAME) as stream:
+            while speaking.is_set() and not interrupted.is_set() and not STOP:
+                if talk_now.is_set():
+                    talk_now.clear()
+                    interrupt()
+                    break
+                data, _ = stream.read(WAKE_FRAME)
+                # stricter than usual: the microphone also hears Jarvis's own voice through the speakers
+                if max(model.predict(data[:, 0]).values()) >= min(0.95, WAKE_SENSITIVITY + 0.25):
+                    print("(you called me while I was talking)")
+                    interrupt()
+                    break
+    except Exception:
+        pass                                            # the microphone is busy or missing: no interruption, no crash
+
+
+def say(text: str, wake_model=None) -> bool:
+    """speak(), listening for an interruption meanwhile. Returns True if you cut Jarvis off."""
+    watcher = None
+    if INTERRUPTIBLE and wake_model is not None:
+        speaking.set()                                  # so the watcher does not give up before the voice starts
+        watcher = threading.Thread(target=watch_for_interruption, args=(wake_model,), daemon=True)
+        watcher.start()
+    speak(text)
+    if watcher is not None:
+        watcher.join(timeout=1)
+    if talk_now.is_set() and INTERRUPTIBLE:            # Space was pressed during a non-wake-word run
+        talk_now.clear()
+        return True
+    return interrupted.is_set()
+
+
+def strip_name(text: str) -> str:
+    """'Hey Jarvis, what time is it?' -> 'what time is it?' (the name often ends up in the recording)."""
+    return re.sub(rf"^\W*(hey|hi|ok|okay)?\W*{re.escape(NAME)}\W*", "", text, count=1, flags=re.IGNORECASE).strip()
+
+
+def hands_free_listen(model, threshold: float):
+    """Wait for 'Hey Jarvis', then record your request on the same microphone stream, so nothing is lost
+    between the name and the question. Works in one breath ('Hey Jarvis, what time is it?') or with a
+    pause for the chime. Returns the text ("" if nothing was heard), or None when STOP was requested."""
+    pre_roll = collections.deque(maxlen=max(1, int(PRE_ROLL_SECONDS * SAMPLE_RATE / WAKE_FRAME)))
+    to_float = lambda samples: samples.astype("float32") / 32768.0
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=WAKE_FRAME) as stream:
+        if not wait_for_wake_word(model, stream, pre_roll):
+            return None
+        chime(wait=False)                               # sounds while we keep listening
+        print("Listening... (speak now)")
+        notify("state", "listening")
+        audio = collect_speech(lambda: to_float(stream.read(WAKE_FRAME)[0][:, 0]), WAKE_FRAME / SAMPLE_RATE,
+                               threshold, start_with=[to_float(f) for f in pre_roll], ignore_seconds=CHIME_SECONDS)
+    if audio is None:
+        return ""
+    heard = transcribe(audio)
+    text = strip_name(heard)
+    if heard and not text:                              # only the name was said: answer, and listen once more
+        speak("Yes?")
+        return listen(threshold)
+    return text
 
 
 def wait_for_enter():
@@ -409,12 +539,86 @@ def fake_tool_call(text: str):
     return None
 
 
+last_action = {"key": None, "result": ""}     # the most recent action in this conversation, so a comment does not repeat it
+
+
+def action_key(name: str, arguments) -> str:
+    """One string that identifies a tool call: its name plus its arguments, in a fixed order."""
+    try:
+        arguments = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
+    except ValueError:
+        pass
+    return f"{name} {json.dumps(arguments, sort_keys=True, default=str)}"
+
+
+def forget_recent_actions() -> None:
+    """A new conversation starts: anything may be done afresh."""
+    last_action["key"], last_action["result"] = None, ""
+
+
+def wants_repeat(text: str) -> bool:
+    return re.search(r"\b(again|repeat|once more|one more time|re-?open|re-?do)\b", text.lower()) is not None
+
+
+TOOL_TRIGGERS = {           # a tool that changes something runs only when your words actually ask for it
+    "save_note": ("save", "note", "remember", "write down", "write this", "write that", "jot", "remind"),
+    "open_website": ("open", "go to", "show", "launch", "bring up", "visit", "website", "site", "browser", "page",
+                     ".com", ".org", ".net", "www"),
+    "search_web": ("search", "look up", "look for", "google", "bing", "find", "browse"),
+}
+
+
+def asked_for(name: str, user_text: str) -> bool:
+    """Did the user actually ask for this tool? Read-only tools (time, weather) are always allowed."""
+    triggers = TOOL_TRIGGERS.get(name)
+    if not triggers:
+        return True
+    text = " " + re.sub(r"[^a-z0-9.' ]+", " ", user_text.lower()) + " "
+    return any(t in text for t in triggers)
+
+
+def perform(name: str, arguments, user_text: str, done_this_turn: set):
+    """Run a tool, unless it is an accidental repeat of what was just done, or something the user never asked
+    for. Small models tend to call the same tool again when your next sentence merely mentions it ("stop opening
+    YouTube" opens YouTube), and to "save a note" out of a stray remark. Returns (result, was_blocked)."""
+    key = action_key(name, arguments)
+    if key in done_this_turn or (key == last_action["key"] and not wants_repeat(user_text)):
+        print(f"   [tool] {name} skipped: already done a moment ago")
+        notify("tool", f"{name} (already done)")
+        return (f"(Skipped: you already did exactly this a moment ago and the result was: {last_action['result'] or 'done'}. "
+                "The user is probably commenting, not asking again. Reply in plain words now, without any tool.)"), True
+    if not asked_for(name, user_text):
+        print(f"   [tool] {name} skipped: the user did not ask for it")
+        notify("tool", f"{name} (not asked for)")
+        return (f'(Not done: the user did not ask for {name}. Their exact words were: "{user_text}". '
+                "Reply to those words in plain language, without any tool.)"), True
+    shown = arguments if isinstance(arguments, str) else json.dumps(arguments)
+    print(f"   [tool] {name} {shown}")
+    notify("tool", f"{name} {shown}")
+    result = run_tool(name, arguments)
+    done_this_turn.add(key)
+    last_action["key"], last_action["result"] = key, result
+    return result, False
+
+
 def think(user_text: str) -> str:
     """Send the user's words to the brain, run any tools it asks for, return the reply."""
     notify("state", "thinking")
     forget_old_messages()
     history.append({"role": "user", "content": user_text})
     nudge_at = None                                     # where the nudge messages sit, so we can remove them later
+    done_this_turn = set()                              # tools already run for this request
+
+    def finish(reply: str) -> str:
+        if nudge_at is not None:                        # drop the nudge chatter, keep everything real
+            del history[nudge_at:nudge_at + 2]
+        history.append({"role": "assistant", "content": reply})
+        return reply
+
+    def answer_in_words(fallback: str) -> str:
+        """Ask the brain once more, with no tools on offer, so the answer has to be a sentence."""
+        response = client.chat.completions.create(model=MODEL, messages=history)
+        return finish((response.choices[0].message.content or "").strip() or fallback)
 
     for _ in range(6):                                  # allow a few tool calls in a row
         response = client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS)
@@ -425,11 +629,11 @@ def think(user_text: str) -> str:
             fake = fake_tool_call(reply)
             if fake and fake[0] in TOOL_FUNCTIONS:      # a real tool, asked for in the wrong way: run it anyway
                 name, arguments = fake
-                print(f"   [tool] {name} {json.dumps(arguments)}")
-                notify("tool", f"{name} {json.dumps(arguments)}")
-                result = run_tool(name, arguments)
+                result, repeated = perform(name, arguments, user_text, done_this_turn)
                 history.append({"role": "assistant", "content": reply})
                 history.append({"role": "user", "content": f"(Result of {name}: {result}) Now answer me in one or two plain sentences."})
+                if repeated:
+                    return answer_in_words("That is already done.")
                 continue
             if fake or not reply:                       # not an answer at all
                 if nudge_at is None:                    # first: give the brain a second chance, tools included
@@ -437,12 +641,8 @@ def think(user_text: str) -> str:
                     history.append({"role": "assistant", "content": reply or "..."})
                     history.append({"role": "user", "content": "(That was not an answer. If one of your tools fits my request, call it properly now. Otherwise answer me in plain words, never JSON.)"})
                     continue
-                response = client.chat.completions.create(model=MODEL, messages=history)   # last resort: plain answer, no tools
-                reply = (response.choices[0].message.content or "").strip() or "I'm not sure what to say to that."
-            if nudge_at is not None:                    # drop the nudge chatter, keep everything real
-                del history[nudge_at:nudge_at + 2]
-            history.append({"role": "assistant", "content": reply})
-            return reply
+                return answer_in_words("I'm not sure what to say to that.")   # last resort: plain answer, no tools
+            return finish(reply)
 
         history.append({                                # remember that the brain asked for tools
             "role": "assistant",
@@ -452,13 +652,15 @@ def think(user_text: str) -> str:
                                          "arguments": call.function.arguments}}
                            for call in message.tool_calls],
         })
+        repeated_any = False
         for call in message.tool_calls:                 # run each tool and report back
-            print(f"   [tool] {call.function.name} {call.function.arguments}")
-            notify("tool", f"{call.function.name} {call.function.arguments}")
-            result = run_tool(call.function.name, call.function.arguments)
+            result, repeated = perform(call.function.name, call.function.arguments, user_text, done_this_turn)
+            repeated_any = repeated_any or repeated
             history.append({"role": "tool", "tool_call_id": call.id, "content": result})
+        if repeated_any:                                # the brain is going in circles: make it answer in words
+            return answer_in_words("That is already done.")
 
-    return "I got a bit lost there. Could you ask that in a different way?"
+    return finish("I got a bit lost there. Could you ask that in a different way?")
 
 
 def safe_think(user_text: str) -> str:
@@ -476,36 +678,78 @@ def safe_think(user_text: str) -> str:
 # =====================================================================
 #  5. THE LOOP - ears -> brain -> hands -> voice, again and again
 # =====================================================================
-QUIT_WORDS = ("exit", "quit", "shut down", "shutdown", "power off")           # close the program
-GOODBYE_WORDS = ("goodbye", "bye", "stop", "that's all", "that is all")   # end the conversation (hands-free: back to standby)
+QUIT_WORDS = ("exit", "quit", "shut down", "shutdown", "power off", "power down", "go to sleep")   # close the program
+GOODBYE_WORDS = ("goodbye", "good bye", "bye", "bye bye", "see you", "see you later", "stop",       # end the conversation
+                 "that's all", "that is all", "never mind", "nevermind")                           # (hands-free: back to standby)
+THANKS_WORDS = ("thank you", "thanks", "thank you very much", "thanks a lot", "many thanks", "cheers", "no thanks")
+FILLER_WORDS = ("hey", "ok", "okay", "please", "now", "then", "well", "alright", "right", "so", "um", "uh")
+NEGATIONS = ("don't", "dont", "do not", "not", "never", "no need")
+NOISE_PHRASES = {"you", "so", "the end", "subscribe", "thanks for watching", "thank you for watching",   # what the ears
+                 "please subscribe", "like and subscribe", "bye bye bye"}                                # "hear" in noise
 
 
-def converse(user_text: str, threshold: float, follow_up_seconds: float, hands_free: bool) -> str:
+def command(text: str):
+    """Is this a goodbye, a shut-down or a thank-you? Ignores the name, punctuation and filler, so
+    'Jarvis, shut down now!' and 'Bye bye.' both count. A command at the END of a short sentence counts too
+    ('Service. Shut down.' is what the ears made of 'Jarvis, shut down'), unless it is negated
+    ('don't shut down'). Returns "quit", "goodbye", "thanks" or None."""
+    words = [w for w in re.sub(r"[^a-z']+", " ", text.lower()).split() if w not in FILLER_WORDS and w != NAME.lower()]
+    phrase = " ".join(words)
+    for wish, phrases in (("quit", QUIT_WORDS), ("goodbye", GOODBYE_WORDS), ("thanks", THANKS_WORDS)):
+        if phrase in phrases:
+            return wish
+    if any(re.search(rf"\b{n}\b", phrase) for n in NEGATIONS):
+        return None
+    for wish, phrases in (("quit", QUIT_WORDS), ("goodbye", GOODBYE_WORDS), ("thanks", THANKS_WORDS)):
+        for p in phrases:
+            if phrase.endswith(" " + p) and len(words) - len(p.split()) <= 3:
+                return wish
+    return None
+
+
+def looks_like_noise(text: str) -> bool:
+    """True for the phrases the speech model invents when it hears typing or rustling instead of words."""
+    words = re.sub(r"[^a-z' ]+", " ", text.lower()).split()
+    return not words or " ".join(words) in NOISE_PHRASES
+
+
+def converse(user_text: str, threshold: float, follow_up_seconds: float, hands_free: bool, wake_model=None) -> str:
     """Answer one request, then (hands-free) keep listening for follow-ups.
     Returns "quit" when Jarvis should close, otherwise "done"."""
+    forget_recent_actions()                             # a new conversation
     while True:
         print(f"You: {user_text}")
         notify("you", user_text)
-        words = user_text.lower().strip(" .!?,")
+        wish = command(user_text)
 
-        if words in QUIT_WORDS or (words in GOODBYE_WORDS and not hands_free):
+        if wish == "quit" or (wish == "goodbye" and not hands_free):
             speak("Goodbye!")
             return "quit"
-        if words in GOODBYE_WORDS:                      # hands-free: back to waiting for the wake word
+        if wish == "goodbye":                           # hands-free: back to waiting for the wake word
             speak("Very good. I'll be here if you need me.")
             return "done"
-
-        speak(safe_think(user_text))
-
-        if follow_up_seconds <= 0:
+        if wish == "thanks":                            # no need to trouble the brain, and nothing should be re-done
+            speak("You're very welcome.")
             return "done"
+
+        cut_off = say(safe_think(user_text), wake_model)
+
+        if cut_off:                                     # you interrupted: listen right now, for a normal turn
+            follow_up_seconds, prompt = max(follow_up_seconds, 6), "Yes? (listening)"
+        elif follow_up_seconds <= 0:
+            return "done"
+        else:
+            prompt = f"(still listening for {follow_up_seconds:g} seconds, no need to say Hey {NAME})"
         try:                                            # a follow-up needs no wake word
-            user_text = listen(threshold, wait_seconds=follow_up_seconds,
-                               prompt=f"(still listening for {follow_up_seconds:g} seconds, no need to say Hey {NAME})")
+            heard = listen(threshold, wait_seconds=follow_up_seconds, prompt=prompt)
+            user_text = strip_name(heard)
+            if heard and not user_text:                 # only the name: answer, and listen once more
+                speak("Yes?")
+                user_text = strip_name(listen(threshold))
         except Exception as error:
             print(f"(microphone problem: {error})")
             return "done"
-        if not user_text:
+        if not user_text or looks_like_noise(user_text):
             return "done"
 
 
@@ -526,8 +770,7 @@ def main(wait_for_user=None) -> None:
     wake_model = load_wake_word_model() if WAKE_WORD else None
     if wake_model is not None:
         hands_free = True
-        wait_for_user = lambda: ("" if wait_for_wake_word(wake_model) else None)
-        how_to_talk = f'Say "Hey {NAME}", wait for the chime, then talk. Say "goodbye" to end a chat, "shut down" to close me.'
+        how_to_talk = f'Say "Hey {NAME}" and ask your question (say it again to interrupt me). Say "goodbye" to end a chat, "shut down" to close me.'
     elif wait_for_user is None:
         hands_free = False
         wait_for_user = wait_for_enter
@@ -543,32 +786,26 @@ def main(wait_for_user=None) -> None:
     while not STOP:
         notify("state", "standby")
         try:
-            typed = wait_for_user()
+            if wake_model is not None:
+                user_text = hands_free_listen(wake_model, threshold)     # None = shut down
+            else:
+                user_text = wait_for_user()                             # None = shut down, "" = use the microphone
+                if user_text == "":
+                    user_text = listen(threshold)
         except KeyboardInterrupt:
-            typed = None
+            user_text = None
         except Exception as error:
-            print(f"(microphone problem: {error})")
+            print(f"(microphone problem: {error} - try typing instead)")
             time.sleep(1)
             continue
-        if typed is None:
+        if user_text is None:
             break
 
-        if typed:
-            user_text = typed
-        else:
-            if hands_free and wake_model is not None:
-                chime()
-            try:
-                user_text = listen(threshold)
-            except Exception as error:
-                print(f"(microphone problem: {error} - try typing instead)")
-                continue
-
-        if not user_text:
+        if not user_text or looks_like_noise(user_text):
             print("I didn't catch that. Try again, a little louder.")
             continue
 
-        if converse(user_text, threshold, FOLLOW_UP_SECONDS if hands_free else 0, hands_free) == "quit":
+        if converse(user_text, threshold, FOLLOW_UP_SECONDS if hands_free else 0, hands_free, wake_model) == "quit":
             break
 
     notify("state", "off")

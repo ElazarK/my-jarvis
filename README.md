@@ -2,8 +2,6 @@
 
 A voice assistant that runs 100% on your own Windows PC. Free, private, no API keys, no monthly fees.
 
-![The Jarvis HUD: a glowing reactor core that reacts while Jarvis listens, thinks and speaks](docs/jarvis-hud-demo.gif)
-
 | Part  | What it does                                        | Made with                                   |
 |-------|-----------------------------------------------------|---------------------------------------------|
 | Ears  | turns your speech into text                         | faster-whisper (runs locally)               |
@@ -54,10 +52,15 @@ All settings are at the top of `jarvis.py`: the model, the voice, the language, 
 2. Test it: `python step4_wakeword.py`, say "Hey Jarvis" and watch the score bar jump. Ctrl+C to quit.
 3. In `jarvis.py` change `WAKE_WORD = False` to `WAKE_WORD = True` and run `python jarvis.py` again.
 
-Now Jarvis waits quietly. Say "Hey Jarvis", wait for the short chime, then talk. After each answer it keeps listening
-for `FOLLOW_UP_SECONDS` (8 by default), so you can carry on the conversation without repeating the name. Say "goodbye"
-to end a conversation and "shut down" (or press Ctrl+C) to close Jarvis. Too many false alarms? Raise
-`WAKE_SENSITIVITY` to 0.6 or 0.7. Does it miss you? Lower it to 0.4.
+Now Jarvis waits quietly. Say "Hey Jarvis, what time is it?" in one breath, or say the name, wait for the short chime
+and then ask; both work. Say only the name and Jarvis answers "Yes?" and waits for you. After each answer it keeps
+listening for `FOLLOW_UP_SECONDS` (8 by default), so you can carry on the conversation without repeating the name.
+Say "goodbye" (or "bye bye", "that's all") or "thank you" to end a conversation and "shut down" (or press Ctrl+C) to
+close Jarvis. Jarvis does each action once per conversation: if you comment on what it just did ("stop opening YouTube"),
+it answers in words instead of doing it again; say "again" when you really want a repeat. Talking too long? Say
+"Hey Jarvis" while it speaks (or press Space in the window) and it stops mid-sentence and listens (`INTERRUPTIBLE`).
+Too many false alarms? Raise `WAKE_SENSITIVITY` to 0.6 or 0.7. Does it miss you? Lower it to 0.4. Mishearing you
+often? Set `WHISPER_SIZE = "small"` for more accurate ears.
 
 The wake-word detection comes from the open-source openWakeWord project and runs fully on your PC. Its ready-made
 "hey jarvis" model is free for personal, non-commercial use (CC BY-NC-SA 4.0).
@@ -68,8 +71,10 @@ Run `python jarvis_hud.py` instead of `python jarvis.py`. A window opens with a 
 Jarvis waits, fires a shockwave and sonar rings while it listens (the core swells with your voice), turns amber while it
 thinks and sends out sound waves while it speaks, with the reply lighting up word by word as it is read out. Around it:
 rotating rings, drifting particles, a clock, and read-outs of the brain, ears and voice in use. Press Space (or click) to talk, F for full screen, Esc to close. With
-`WAKE_WORD = True` in `jarvis.py` the window is hands-free too. All your settings and tools carry over, because the
-window simply runs `jarvis.py` underneath. Window size, colours and an always-on-top option are at the top of `jarvis_hud.py`.
+`WAKE_WORD = True` in `jarvis.py` the window is hands-free too, and you can leave it in the background or minimised
+while you work: the moment Jarvis hears its name the window jumps to the front, on top of everything, and steps back
+when the conversation ends (`POP_UP_ON_WAKE`). All your settings and tools carry over, because the window simply runs
+`jarvis.py` underneath. Window size, colours and an always-on-top option are at the top of `jarvis_hud.py`.
 
 ## Add your own tool
 

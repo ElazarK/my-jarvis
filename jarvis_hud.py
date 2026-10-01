@@ -12,6 +12,9 @@ word) comes from jarvis.py, so all your settings and tools carry over unchanged.
 Keys:  Space, or a mouse click  = talk (not needed when WAKE_WORD = True in jarvis.py)
        F                        = full screen on and off
        Esc, or close the window = shut Jarvis down
+
+Leave the window open in the background (or minimised) while you work: the moment Jarvis hears its name it
+jumps to the front, on top of everything, and steps back when the conversation is over.
 """
 import math
 import os
@@ -28,7 +31,9 @@ import pygame
 # =====================================================================
 WINDOW_SIZE = (960, 600)        # width and height in pixels; you can also drag the window edges
 FULL_SCREEN = False             # True = fill the whole screen (press F to switch at any time)
-ALWAYS_ON_TOP = False           # True = stay above other windows, handy as a small corner widget
+ALWAYS_ON_TOP = False           # True = stay above other windows all the time, handy as a small corner widget
+POP_UP_ON_WAKE = True           # True = the window comes to the front, on top, whenever Jarvis hears its name
+                                #        (or you press Space), and steps back when the conversation ends
 ACCENT = (64, 196, 255)         # the Jarvis blue, used for the name, the frame and the captions
 FRAMES_PER_SECOND = 30
 WORDS_PER_SECOND = 2.6          # how fast the voice talks; the captions light up word by word at this pace
@@ -69,9 +74,15 @@ class Status:
         self.note = "Loading the ears and the brain, one moment..."
         self.name = "JARVIS"
         self.exchanges = 0          # how many things you have said this session
+        self.come_forward = False   # set when a conversation starts; the window loop brings the window to the front
+        self.step_back = False      # set when it ends; the window loop lets other windows on top again
 
     def on_event(self, event, value=""):
         if event == "state":
+            if value == "listening" and self.state in ("standby", "starting"):
+                self.come_forward = True                # Jarvis heard its name: show yourself
+            elif value == "standby" and self.state != "starting":
+                self.step_back = True
             self.state, self.since = str(value), time.time()
             if value == "listening":
                 self.level = 0.0
@@ -106,10 +117,13 @@ def run_jarvis():
 
 
 def talk():
-    """Space key or mouse click: tell Jarvis to listen right now."""
+    """Space key or mouse click: tell Jarvis to listen right now. If it is talking, cut it off first."""
     jarvis = bridge.get("jarvis")
     if jarvis is not None:
-        jarvis.talk_now.set()
+        if getattr(jarvis, "speaking", None) is not None and jarvis.speaking.is_set():
+            jarvis.interrupt()
+        else:
+            jarvis.talk_now.set()
 
 
 def setting(name, default=""):
@@ -490,19 +504,59 @@ def draw(screen, fonts, t):
     if status.state in ("starting", "off"):
         hint = status.note
     else:
-        hint = "SPACE or click = talk     F = full screen     ESC = close"
+        hint = "SPACE or click = talk (or interrupt)     F = full screen     ESC = close     or say: shut down"
     foot = fonts["small"].render(hint, True, DIM_TEXT)
     screen.blit(foot, (margin, height - foot.get_height() - 12))
 
 
-def keep_on_top():
-    """Windows only: keep the window above all others."""
+# =====================================================================
+#  THE WINDOW ITSELF (Windows): on top, to the front, restored from the taskbar
+# =====================================================================
+def window_handle():
+    try:
+        return pygame.display.get_wm_info()["window"]
+    except Exception:
+        return None
+
+
+def set_on_top(on_top: bool) -> None:
+    """Pin the window above every other window (or unpin it)."""
+    hwnd = window_handle()
+    if not hwnd:
+        return
     try:
         import ctypes
-        hwnd = pygame.display.get_wm_info()["window"]
-        ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)    # topmost, keep size and place
+        HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+        SWP_NOSIZE, SWP_NOMOVE, SWP_SHOWWINDOW = 0x0001, 0x0002, 0x0040
+        ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST if on_top else HWND_NOTOPMOST, 0, 0, 0, 0,
+                                          SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW)
     except Exception:
         pass
+
+
+def bring_to_front() -> None:
+    """Jarvis heard its name: un-minimise the window, put it on top and give it the focus."""
+    hwnd = window_handle()
+    if not hwnd:
+        return
+    set_on_top(True)
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.keybd_event(0x12, 0, 0, 0)               # a phantom Alt tap: Windows then allows a background
+        user32.keybd_event(0x12, 0, 0x0002, 0)          # program to take the foreground
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def step_back() -> None:
+    """The conversation is over: stop hogging the top of the screen (unless ALWAYS_ON_TOP says otherwise)."""
+    if not ALWAYS_ON_TOP:
+        set_on_top(False)
 
 
 # =====================================================================
@@ -515,7 +569,7 @@ def main():
                                      pygame.FULLSCREEN if full else pygame.RESIZABLE)
     pygame.display.set_caption("Jarvis")
     if ALWAYS_ON_TOP:
-        keep_on_top()
+        set_on_top(True)
     fonts = make_fonts(screen.get_height())
     clock = pygame.time.Clock()
 
@@ -542,6 +596,18 @@ def main():
                 talk()
             elif event.type == pygame.VIDEORESIZE:
                 fonts = make_fonts(event.h)
+        if status.come_forward:                         # Jarvis woke up: show the face
+            status.come_forward = False
+            if POP_UP_ON_WAKE:
+                bring_to_front()
+        if status.step_back:
+            status.step_back = False
+            if POP_UP_ON_WAKE:
+                step_back()
+        if status.state == "off":                       # Jarvis said goodbye (or could not start): close the window too,
+            grace = 6.0 if "stopped" in status.note else 1.5     # after a moment, so the last words can be read
+            if time.time() - status.since > grace:
+                running = False
         draw(screen, fonts, time.time() - started)
         pygame.display.flip()
         clock.tick(FRAMES_PER_SECOND)
@@ -549,10 +615,13 @@ def main():
     jarvis = bridge.get("jarvis")
     if jarvis is not None:
         jarvis.STOP = True                          # ask the assistant loop to finish...
-        worker.join(timeout=3)                      # ...and give it a moment to do so
-    pygame.quit()
+        worker.join(timeout=2)                      # ...and give it a moment to do so
+    try:
+        pygame.quit()
+    except Exception:
+        pass
     sys.stdout.flush()
-    os._exit(0)                                     # make sure nothing keeps running in the background
+    os._exit(0)                                     # then leave, whatever the microphone or the voice were doing
 
 
 if __name__ == "__main__":
